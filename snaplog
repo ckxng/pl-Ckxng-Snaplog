@@ -1,0 +1,342 @@
+#!/usr/bin/perl
+use strict;
+use warnings;
+
+=head1 NAME
+
+snaplog - A tool for collecting diagnostic data in a hurry
+
+=cut
+
+package Ckxng::SnapLog;
+
+=head1 SYNOPSIS
+
+snaplog
+
+    -h --help     print this message
+    -H --host     specify multiple times for multiple remost hosts
+    -o --out      file to write the output to or - for STDOUT
+                  (default: /var/tmp/snaplog/{DATE}.log)
+    -c --config   specify config file (list of commands to run)
+    -v --verbose  specify multiple times to increase verbosity
+
+=cut
+
+my $HELP = <<HELP;
+snaplog
+
+    -h --help     print this message
+    -H --host     specify multiple times for multiple remost hosts
+    -o --out      file to write the output to or - for STDOUT
+                  (default: /var/tmp/snaplog/{DATE}.log)
+    -c --config   specify config file (list of commands to run)
+    -v --verbose  specify multiple times to increase verbosity
+HELP
+
+=head1 DESCRIPTION
+
+This tool collects diagnostic data from a server, either remotely
+or locally.  Both system and application-specific metrics are collected
+based on the detected applications.
+
+=head1 VERSION
+
+snaplog 0.0.1
+
+=cut
+
+my $VERSION = '0.0.1';
+
+=head2 CONFIG
+
+The config file format for B<snaplog> is very simple.  Each line is a single
+command that will be run by B<snaplog>.
+
+There is a single directive, "#if" which controls whether the commands after it
+will be executed.  During config file processing, the #if directive will cause
+the specified command to be executed.  If that command returns a sucessfull
+return code (zero), then the commands after it will be executed.  If that
+command returns an error return code (non-zero), then the commands that follow
+it will not be executed. 
+
+This is the built-in config:
+
+    id
+    date
+    top -bn1
+    ps auxfww
+    vmstat 1 10
+    iostat 1 10
+    free -m
+    df -h
+    #if which apachectl
+    links -dump http://127.0.0.1/server-status
+    
+
+=cut
+
+my $DEFAULTCONFIG = <<DEFAULTCONFIG;
+id
+date
+top -bn1
+ps auxfww
+vmstat 1 10
+iostat 1 10
+free -m
+df -h
+#if which apachectl
+links -dump http://127.0.0.1/server-status
+DEFAULTCONFIG
+
+=head1 SUBROUTINES
+
+=head2 B<opts>()
+
+Utility function for parsing options from the commandline when the script
+is called directly.
+
+B<Returns> (hashref) options parsed from commandline
+
+    {
+      "help" => (integer) 1 if help text is requested, 0 otherwise (CLI mode)
+      "host" => ["host1", "host2"] or undef for local,
+      "out" => "filename" or "-" for stdout,
+      "config" => "filename" or "-" for stdin,
+      "verbose" => (integer) 0 or larger number indicating verbosity
+    }
+
+=cut
+
+sub opts {
+  my $opts = {
+    "help" => 0,
+    "host" => [],
+    "out" => undef,
+    "config" => undef,
+    "verbose" => 0,
+  };
+  use Getopt::Long;
+  GetOptions (
+    "help|h" => \$opts->{'help'},
+    "host|H=s" => \@{ $opts->{'host'} }, 
+    "out|o=s" => \$opts->{'out'},
+    "config|c=s" => \$opts->{'config'},
+    "verbose|v+" => \$opts->{'verbose'},
+  );
+  return $opts;
+}
+
+=head2 run(command, hostname, callback)
+
+I<command> is a required parameter.
+
+Run the command specified by I<command>.  If I<hostname> is a scalar, run the
+command against the host specified by that string.
+
+If I<callback> is specified, then call I<callback>(I<err>, I<data>).
+
+    $err = (string) error text or undef if no error
+    $data = {
+      'return' => (integer) return code,
+      'out' => (string) standard output response from command,
+      'error' => (string) error response from command,
+    }
+
+B<Returns> (hashref) the value specified by I<data> above or undef if there was
+an error.
+
+Using the callback is the best way to capture error strings.
+
+=cut
+
+sub run {
+  my $command = shift or die "run: command is a require parameter\n";
+  my $hostname = shift;
+  my $callback = shift;
+  my $error = undef;
+  my $data = {
+    "command" => $command,
+    "hostname" => $hostname,
+    "return" => undef,
+    "output" => "",
+    "error" => ""
+  };
+
+  my $prefix = "";
+  $prefix = "ssh $hostname " if defined($hostname);
+
+  use IPC::Open3;
+  my $pid = open3(\*WRITER, \*READER, \*ERROR, "$prefix$command");  
+  close(WRITER);
+  my ($obuf, $ebuf) = ("","");
+  while(defined($obuf = <READER>) || defined($ebuf = <ERROR>)) {
+    $data->{"output"} .= $obuf if defined($obuf);
+    $data->{"error"} .= $ebuf if defined($ebuf);
+  }
+  waitpid($pid, 0) or $error = $!;
+  $data->{"return"} = $?>>8;
+
+  &$callback($error, $data);
+}
+
+=head2 B<parse_config>(text)
+
+Parse the config file contained in the string I<text>.
+
+Lines beginning with # specify commands that should be immediately run during
+parsing.  If the command returns 0, then all of the entries that follow it will
+be added to the command list.  If the command returns an error (not 0), then
+the entries that follow it will not be added to the command list.
+
+Entries are added to the command list by default.
+
+Returns (arrayref) of (string) commands that were added to the list
+
+=cut
+
+sub parse_config {
+  my $text = shift or die "parse_config: text is required\n";
+  my @entries = split /\n/, $text;
+  my $commands = [];
+  my $parsing = 1;
+
+  for my $entry(@entries) {
+    if($entry =~ /^#if\s/) {
+      my $run = substr($entry, 4);
+      run($run, undef, sub {
+        my ($error, $data) = @_;
+        if($error || $data->{'return'}) {
+          $parsing = 0;
+        } else {
+          $parsing = 1;
+        }
+      });
+      next;
+    } elsif($entry =~ /^#/) {
+      next;
+    }
+    
+    push @{ $commands }, $entry if $parsing;
+  }
+
+  return $commands;
+}
+
+=head2 B<main>()
+
+The main subroutine.  Called when the package is invoked as a script.
+
+This subroutine parses options, and loops through all the diagnostic 
+commands.
+
+=cut
+
+sub main {
+  my $opt = opts();
+
+  if($opt->{'help'}) {
+    print $HELP;
+    return;
+  }
+
+  my $date = `date -u +"%Y-%m-%dT%H:%M:%SZ"`;
+  chomp $date;
+  my $outfh = undef;
+
+  if(defined($opt->{'out'})) {
+    if($opt->{'out'} eq "-") {
+      $outfh = *STDOUT;
+    } else {
+      open($outfh, ">>$opt->{out}") or die "unable to open: $opt->{out}\n";
+    }
+  } else {
+    $opt->{'out'} = "/var/tmp/snaplog/$date.log";
+    mkdir "/var/tmp/snaplog" unless -d "/var/tmp/snaplog";
+    open($outfh, ">>$opt->{out}") or die "unable to open: $opt->{out}\n";
+  }
+
+  my $printer = sub {
+      my ($err, $data) = @_;
+      $data->{"hostname"} = 'localhost' unless $data->{"hostname"};
+      if($err) {
+        print STDERR "ERROR on $data->{hostname}: $err";
+        return;
+      }
+
+      $data->{'command'} =~ /^(\w+)/;
+      my $cmd = $1;
+
+      printf STDOUT "." if $opt->{'verbose'} == 1;
+      printf STDOUT "Completed (ret %s): %s\n", $data->{'return'}, $data->{'command'} if $opt->{'verbose'} >= 2;
+      printf $outfh "%s:%s:%s:cmd:%s\n", $data->{'hostname'}, $date, $cmd, $data->{'command'};
+      printf $outfh "%s:%s:%s:ret:%s\n", $data->{'hostname'}, $date, $cmd, $data->{'return'};
+      printf $outfh "%s:%s:%s:out:%s\n", $data->{'hostname'}, $date, $cmd, $_ for split /\n/, $data->{'output'};
+      printf $outfh "%s:%s:%s:err:%s\n", $data->{'hostname'}, $date, $cmd, $_ for split /\n/, $data->{'error'};
+  };
+
+  my $config = $DEFAULTCONFIG;
+
+  if(defined($opt->{'config'})) {
+    $config = "";
+    if($opt->{'config'} eq "-") {
+      $config .= $_ while <>;
+    } else {
+      my $cfgfh = undef;
+      open($cfgfh, $opt->{'config'}) or die "unable to read config: $opt->{config}\n";
+      $config .= $_ while <$cfgfh>;
+      close $cfgfh;
+    }
+  }
+
+  for my $command(@{ parse_config($config) }) {
+    if($#{ $opt->{'host'} } > -1) {
+      for my $host(@{ $opt->{'host'} }) {
+        print "===== $host =====\n";
+        run($command, $host, $printer);
+      }
+    } else {
+      run($command, undef, $printer);
+    }
+  }
+
+  printf STDOUT "\n" if $opt->{'verbose'} == 1;
+  printf STDOUT "Logged to: %s\n", $opt->{'out'} if $opt->{'verbose'} >= 1;
+}
+main() unless caller;
+
+=head1 BUGS
+
+Open a ticket assigned to Production Systems (or more specifically 
+Cameron King) to report bugs with this application.
+
+=head1 COPYRIGHT
+
+Copyright (c) 2014, Cameron King.
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice, this
+list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright notice,
+this list of conditions and the following disclaimer in the documentation
+and/or other materials provided with the distribution.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+=head1 AUTHOR
+
+Casmeron King <http://cameronking.me>
+
